@@ -207,7 +207,7 @@ def process_extract_clip(clip_id, s3_source, video_id):
         s3_client.upload_file(local_output, S3_BUCKET, s3_dest_key)
         
         # Aggiornamento stato su Supabase
-        supabase.table("clips").update({"status": "CLIPPED", "s3_source": s3_dest_keys}).eq("id", clip_id).execute()
+        supabase.table("clips").update({"status": "CLIPPED", "s3_source": s3_dest_key}).eq("id", clip_id).execute()
         print(f"[{clip_id}] Clip estratta e caricata con successo.")
         
     except Exception as e:
