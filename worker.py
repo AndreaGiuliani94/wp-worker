@@ -316,7 +316,7 @@ def process_extract_clip(job_id, video_id):
     tmp_dir = f"/mnt/data/clip_temp/zip_{zip_id}"
     os.makedirs(tmp_dir, exist_ok=True)
     local_zip_path = os.path.join(tmp_dir, f"zip_{zip_id}.zip")
-    video_s3_source = supabase.table('videos').select('s3_source').eq("id", video_id).single().execute().data
+    video_s3_source = supabase.table('videos').select('s3_source').eq("id", video_id).single().execute().data.get('s3_source')
     
     try:        
         # 3. Crea lo ZIP creando e comprimendo una clip alla volta
@@ -339,12 +339,12 @@ def process_extract_clip(job_id, video_id):
                 os.remove(local_clip_path)
         
         # 4. Upload dello ZIP finale su S3
-        s3_dest_key = f"{video_id}/clip/zip_{zip_id}.zip"
+        s3_dest_key = f"{video_id}/clips/zip_{zip_id}.zip"
         print(f"[{video_id}] Upload ZIP finale su S3 in {s3_dest_key}...")
         s3_client.upload_file(local_zip_path, S3_BUCKET, s3_dest_key)
         
         # 5. Aggiorna Supabase a READY
-        supabase.table('zip_files').update({'status': 'READY'}).eq('id', zip_id).execute()
+        supabase.table('jobs').update({'status': 'COMPLETED', 'zip_s3_source': s3_dest_key}).eq('id', zip_id).execute()
         print(f"[{video_id}] Creazione ZIP {zip_id} completata con successo!")
 
     except Exception as e:
@@ -384,7 +384,7 @@ def main():
                 if job_type == 'generate_hls':
                     process_generate_hls(video_id, body['s3_source'])
                     
-                elif job_type == 'extract_clips':
+                elif job_type == 'extract_clip':
                     process_extract_clip(
                         job_id=body['job_id'],
                         video_id=video_id
