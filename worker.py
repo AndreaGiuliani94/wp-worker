@@ -8,6 +8,8 @@ import tempfile
 import threading
 import uuid
 import zipfile
+import signal
+import sys
 from supabase import create_client, Client
 
 # ==========================================
@@ -33,6 +35,21 @@ SUPABASE_KEY = get_parameter("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 s3_client = boto3.client('s3', region_name=AWS_REGION)
 sqs_client = boto3.client('sqs', region_name=AWS_REGION)
+
+# Stato del worker
+is_processing = False
+keep_running = True
+
+# Gestione segnale SIGTERM (inviato da ASG durante lo Scale-In)
+def graceful_exit(signum, frame):
+    global keep_running
+    print("\nSegnale di terminazione ricevuto. Chiusura in corso...")
+    keep_running = False
+    # Se non stiamo processando, usciamo subito
+    if not is_processing:
+        sys.exit(0)
+
+signal.signal(signal.SIGTERM, graceful_exit)
 
 def update_video_status(video_id, status):
     """Aggiorna lo stato del video nella tabella 'videos' di Supabase."""
@@ -202,7 +219,7 @@ def process_generate_hls(video_id, s3_source):
                 shutil.rmtree(tmp_dir)
                 print(f"[{video_id}] Pulizia disco completata.")
     
-def process_extract_clip(clip_id, s3_source, video_id):
+def extract_and_upload_clip(clip_id, s3_source, video_id):
     """Estrae una clip video frame-accurate partendo da un timestamp e la carica su S3."""
     print(f"[{clip_id}] Inizio estrazione clip del video {video_id}, presente al path {s3_source}...")
     
@@ -271,27 +288,27 @@ def process_extract_clip(clip_id, s3_source, video_id):
         supabase.table("clips").update({"status": "CLIPPED", "s3_source": s3_dest_key}).eq("id", clip_id).execute()
         print(f"[{clip_id}] Clip estratta e caricata con successo.")
         
+        return local_output;
+        
     except Exception as e:
         print(f"[{clip_id}] Errore durante l'estrazione: {e}")
         supabase.table("clips").update({"status": "ERROR"}).eq("id", clip_id).execute()
-    finally:
-        if os.path.exists(local_output):
-            os.remove(local_output)
 
-def process_create_zip(video_id, clip_ids):
+def process_extract_clip(job_id, video_id):
     """
     Scarica un array di clip da S3, le comprime in un file ZIP una alla volta (cancellandole),
     carica il file ZIP su S3 e aggiorna lo stato su Supabase.
     """
     zip_id = str(uuid.uuid4())
-    print(f"[{video_id}] Inizio creazione ZIP {zip_id} per {len(clip_ids)} clip...")
+    print(f"[{video_id}] Inizio creazione ZIP {zip_id} per il job {job_id}...")
     
-    # 1. Crea la riga su Supabase in stato CREATED
     try:
-        supabase.table('zip_files').insert({
-            'id': zip_id,
-            'status': 'CREATED'
-        }).execute()
+        res = supabase.table('jobs').select("*, clips(id)").eq("id", job_id).execute()
+        job_data = res.data[0]
+        # Estrae gli id, crea l'array piatto e rimuove la vecchia chiave 'clips'
+        job_data["clip_ids"] = [clip["id"] for clip in job_data.pop("clips", [])]
+        clip_ids = job_data["clip_ids"]
+        print(f"Trovate {len(clip_ids)} clip associato al job {job_id}")
     except Exception as e:
         print(f"[{video_id}] Errore durante la creazione del record zip_files: {e}")
         return
@@ -299,19 +316,14 @@ def process_create_zip(video_id, clip_ids):
     tmp_dir = f"/mnt/data/clip_temp/zip_{zip_id}"
     os.makedirs(tmp_dir, exist_ok=True)
     local_zip_path = os.path.join(tmp_dir, f"zip_{zip_id}.zip")
+    video_s3_source = supabase.table('videos').select('s3_source').eq("id", video_id).single().execute().data
     
-    try:
-        # 2. Query su Supabase per leggere i s3_source delle clip
-        # Assicurati che il nome della tabella sia corretto (es. 'clips')
-        response = supabase.table('clips').select('s3_source').in_('id', clip_ids).execute()
-        clips_data = response.data
-        
-        if not clips_data:
-            raise Exception("Nessuna clip trovata su Supabase per gli ID forniti.")
-
-        # 3. Crea lo ZIP scaricando e comprimendo una clip alla volta
+    try:        
+        # 3. Crea lo ZIP creando e comprimendo una clip alla volta
         with zipfile.ZipFile(local_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for clip in clips_data:
+            for clip_id in clip_ids:
+                local_clip_path = extract_and_upload_clip(clip_id, video_s3_source, video_id)
+                clip = supabase.table('clips').select('*').eq('id', clip_id).single().execute().data
                 s3_source = clip.get('s3_source')
                 if not s3_source:
                     continue
@@ -319,10 +331,6 @@ def process_create_zip(video_id, clip_ids):
                 # Estrai il nome del file (es. clip_123.mp4) e rimuovi eventuale prefisso s3://
                 clip_filename = s3_source.split('/')[-1]
                 s3_key = s3_source.replace(f"s3://{S3_BUCKET}/", "")
-                local_clip_path = os.path.join(tmp_dir, clip_filename)
-                
-                print(f"[{video_id}] Download clip {clip_filename} per ZIP...")
-                s3_client.download_file(S3_BUCKET, s3_key, local_clip_path)
                 
                 zipf.write(local_clip_path, arcname=clip_filename)
                 print(f"[{video_id}] Aggiunta {clip_filename} allo ZIP...")
@@ -353,7 +361,7 @@ def process_create_zip(video_id, clip_ids):
 def main():
     print("Worker EC2 avviato. In attesa di messaggi SQS...")
     
-    while True:
+    while keep_running:
         # Long Polling: aspetta 20 secondi se la coda è vuota (fa risparmiare chiamate API)
         response = sqs_client.receive_message(
             QueueUrl=SQS_QUEUE_URL,
@@ -367,6 +375,8 @@ def main():
             
         for msg in messages:
             try:
+                global is_processing
+                is_processing = True
                 body = json.loads(msg['Body'])
                 job_type = body.get('job_type')
                 video_id = body.get('video_id')
@@ -374,15 +384,9 @@ def main():
                 if job_type == 'generate_hls':
                     process_generate_hls(video_id, body['s3_source'])
                     
-                elif job_type == 'extract_clip':
+                elif job_type == 'extract_clips':
                     process_extract_clip(
-                        clip_id=body['clip_id'],
-                        s3_source=body['s3_source'],
-                        video_id=video_id
-                    )
-                elif job_type == 'create_zip':
-                    process_create_zip(
-                        clip_ids=body['clip_ids'],
+                        job_id=body['job_id'],
                         video_id=video_id
                     )
                 else:
@@ -394,6 +398,7 @@ def main():
                     ReceiptHandle=msg['ReceiptHandle']
                 )
                 print("Messaggio rimosso dalla coda con successo.\n---")
+                is_processing = False
                 
             except Exception as e:
                 # Se c'è un errore (es. FFmpeg fallisce), il messaggio NON viene cancellato.
